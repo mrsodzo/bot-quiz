@@ -41,8 +41,8 @@ def kb(options):
 def kb_result():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton("Узнать подробнее", callback_data="details")],
-            [InlineKeyboardButton("Оставить заявку на консультацию", callback_data="contact")],
+            [InlineKeyboardButton(text="Узнать подробнее", callback_data="details")],
+            [InlineKeyboardButton(text="Оставить заявку на консультацию", callback_data="contact")],
         ]
     )
 
@@ -50,8 +50,8 @@ def kb_result():
 def kb_confirm():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton("Все верно", callback_data="confirm")],
-            [InlineKeyboardButton("Исправить", callback_data="retry_contact")],
+            [InlineKeyboardButton(text="Все верно", callback_data="confirm")],
+            [InlineKeyboardButton(text="Исправить", callback_data="retry_contact")],
         ]
     )
 
@@ -63,7 +63,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Привет! Отвечу за 1 минуту, какой формат тренировок подойдёт именно вам. Начнём?",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton("Начать подбор", callback_data="start_quiz")]
+                [InlineKeyboardButton(text="Начать подбор", callback_data="start_quiz")]
             ]
         ),
     )
@@ -171,8 +171,8 @@ async def handle_result_action(callback: CallbackQuery, state: FSMContext):
             text=text,
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton("Оставить заявку", callback_data="contact")],
-                    [InlineKeyboardButton("Назад", callback_data="back_to_result")],
+                    [InlineKeyboardButton(text="Оставить заявку", callback_data="contact")],
+                    [InlineKeyboardButton(text="Назад", callback_data="back_to_result")],
                 ]
             ),
             parse_mode=ParseMode.HTML,
