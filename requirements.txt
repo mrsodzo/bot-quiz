@@ -3,4 +3,3 @@ sqlalchemy[asyncio]>=2.0,<3
 aiosqlite>=0.19
 python-dotenv>=1.0
 pydantic==2.13.4
-pydantic-core==2.23.4
