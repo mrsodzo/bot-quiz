@@ -1,7 +1,7 @@
 services:
   - type: web
     name: fitness-quiz-bot
-    runtime: python
+    runtime: python-3.13
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python -m src.main
