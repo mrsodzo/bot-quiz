@@ -4,7 +4,7 @@
 
 ## Онлайн-доступ
 
-Бот развёрнут на Render и доступен в Telegram: **@fitnes_quiz_bot**
+Бот развёрнут на Render: **@fitnes_quiz_bot**
 
 ## Сценарий
 
@@ -15,43 +15,64 @@
 
 ## Технологии
 
-- Python 3.13
-- `python-telegram-bot` v21.6
-- SQLite через `sqlite3`
-- `python-dotenv` для конфигурации
+- Python 3.13+
+- `aiogram` 3.x
+- `aiohttp` (веб-сервер/webhook)
+- `sqlalchemy[asyncio]` + `aiosqlite`
+- `python-dotenv`
 
-## Установка
+## Деплой на Render
+
+### Через `render.yaml`
+
+Файл `render.yaml` уже настроен:
+- **Build**: `pip install -r requirements.txt`
+- **Start**: `python -m src.main`
+- Режим: webhook + `/health` endpoint
+
+### Переменные окружения
+
+- `TELEGRAM_BOT_TOKEN` — от @BotFather
+- `ADMIN_CHAT_ID` — ваш чат с @userinfobot
+- `WEBHOOK_PATH` — обычно `/webhook`
+- `RENDER_EXTERNAL_URL` или `WEBHOOK_URL` — Render задаёт первый автоматически
+- `PORT` — Render задаёт автоматически, не меняйте
+- `DB_PATH` — по умолчанию `data/quiz.db`
+
+### Примечание
+
+При использовании бесплатного инстанса Render бот засыпает после 15 минут неактивности. При первом запросе после пробуждения ответ может задержаться до 50 секунд.
+
+## Локальный запуск
 
 ```bash
-git clone <repo-url>
+git clone <repo>
 cd bot-quiz
 pip install -r requirements.txt
-```
-
-## Конфигурация
-
-Создайте `.env` на основе `.env.example`:
-
-```
-TELEGRAM_BOT_TOKEN=токен_от_BotFather
-ADMIN_CHAT_ID=ID_чата_админа
-```
-
-`ADMIN_CHAT_ID` можно получить у @userinfobot.
-
-## Запуск
-
-```bash
+cp .env.example .env
 python -m src.main
+```
+
+Для теста вебхука локально (например через ngrok):
+```
+WEBHOOK_URL=https://<ngrok-url>/webhook python -m src.main
 ```
 
 ## Структура
 
 ```
 src/
-├── main.py        # Точка входа
-├── bot.py         # ConversationHandler + хендлеры
-├── config.py      # Переменные окружения
-├── db.py          # SQLite CRUD
-└── scoring.py     # Вопросы, тарифы, баллы
+├── __init__.py
+├── main.py         # aiohttp webhook server + /health
+├── bot.py          # aiogram handlers + FSM
+├── config.py       # переменные окружения
+├── models.py       # SQLAlchemy ORM модели
+├── db.py           # async SQLite CRUD + миграции
+└── scoring.py      # вопросы, тарифы, матрица баллов
 ```
+
+## Инициализация БД
+
+При старте и `python -m src.main()` автоматически:
+- создаются таблицы `quiz_results` и `contacts`;
+- добавляется демо-запись, чтобы база не была пустой.

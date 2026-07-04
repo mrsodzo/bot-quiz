@@ -2,172 +2,164 @@ import json
 import logging
 from datetime import datetime
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
+from aiogram import Bot, F, Router
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
-from src.config import get_bot_token, get_admin_chat_id
-from src.scoring import QUESTIONS, TARIFFS, TARIFF_KEYS, SCORES
-from src.db import init_db, save_quiz_result, save_contact, get_quiz_result_with_contact
+from src.config import get_admin_chat_id
+from src.db import save_quiz_result, save_contact, get_quiz_result_with_contact
+from src.scoring import QUESTIONS, TARIFFS, calculate_tariff
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+router = Router()
 logger = logging.getLogger(__name__)
 
-MENU, Q1, Q2, Q3, Q4, RESULT, CONTACT_NAME, CONTACT_PHONE, CONTACT_CONFIRM = range(9)
+
+class QuizStates(StatesGroup):
+    menu = State()
+    q1 = State()
+    q2 = State()
+    q3 = State()
+    q4 = State()
+    result = State()
+    contact_name = State()
+    contact_phone = State()
+    contact_confirm = State()
 
 
-def build_keyboard(options):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text=opt, callback_data=opt)] for opt in options])
+def kb(options):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=o, callback_data=o)] for o in options])
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Отвечу за 1 минуту, какой формат тренировок подойдёт именно вам. Начнём?",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Начать подбор", callback_data="start_quiz")]]),
+def kb_result():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton("Узнать подробнее", callback_data="details")],
+            [InlineKeyboardButton("Оставить заявку на консультацию", callback_data="contact")],
+        ]
     )
-    return MENU
 
 
-async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data.clear()
-    return await send_question(update, context, 0)
+def kb_confirm():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton("Все верно", callback_data="confirm")],
+            [InlineKeyboardButton("Исправить", callback_data="retry_contact")],
+        ]
+    )
 
 
-async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, index: int):
-    if index >= len(QUESTIONS):
-        return await show_result(update, context)
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Привет! Отвечу за 1 минуту, какой формат тренировок подойдёт именно вам. Начнём?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton("Начать подбор", callback_data="start_quiz")]
+            ]
+        ),
+    )
+    await state.set_state(QuizStates.menu)
 
-    question = QUESTIONS[index]
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text=question["text"],
-            reply_markup=build_keyboard(question["options"]),
-        )
+
+@router.callback_query(F.data == "start_quiz")
+async def start_quiz(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await state.update_data(answers={}, current_question=0)
+    await send_question(callback.message, state, 0)
+    await state.set_state(QuizStates.q1)
+
+
+@router.callback_query(F.data)
+async def handle_answer(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    current_state = await state.get_state()
+
+    if current_state == QuizStates.result.state:
+        await handle_result_action(callback, state)
+        return
+
+    if current_state == QuizStates.contact_confirm.state:
+        if callback.data == "confirm":
+            await confirm_contact(callback, state, bot)
+        elif callback.data == "retry_contact":
+            await retry_contact(callback, state)
+        return
+
+    if current_state == QuizStates.menu.state and callback.data != "start_quiz":
+        await callback.answer("Сначала нажмите «Начать подбор»")
+        return
+
+    state_to_idx = {
+        QuizStates.q1.state: 0,
+        QuizStates.q2.state: 1,
+        QuizStates.q3.state: 2,
+        QuizStates.q4.state: 3,
+    }
+    if current_state not in state_to_idx:
+        await callback.answer("Сначала нажмите /start")
+        return
+
+    await callback.answer()
+    idx = state_to_idx[current_state]
+    answers = data.get("answers", {})
+    answers[QUESTIONS[idx]["key"]] = callback.data
+    await state.update_data(answers=answers, current_question=idx + 1)
+
+    next_idx = idx + 1
+    if next_idx >= len(QUESTIONS):
+        await state.set_state(QuizStates.result)
+        await show_result(callback.message, state)
     else:
-        msg = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=question["text"],
-            reply_markup=build_keyboard(question["options"]),
-        )
-
-    state = [Q1, Q2, Q3, Q4][index]
-    return state
+        await send_question(callback.message, state, next_idx)
+        next_state = [QuizStates.q1, QuizStates.q2, QuizStates.q3, QuizStates.q4][next_idx]
+        await state.set_state(next_state)
 
 
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    answer = query.data
-    current_index = context.user_data.get("current_question", 0)
-    key = QUESTIONS[current_index]["key"]
-    context.user_data.setdefault("answers", {})[key] = answer
-    context.user_data["current_question"] = current_index + 1
-    return await send_question(update, context, current_index + 1)
+async def send_question(message: Message, state: FSMContext, index: int):
+    if index >= len(QUESTIONS):
+        return
+    q = QUESTIONS[index]
+    await message.answer(q["text"], reply_markup=kb(q["options"]))
 
 
-def calculate_tariff(answers: dict) -> tuple:
-    scores = {tariff: 0 for tariff in TARIFF_KEYS}
-
-    freq = answers.get("frequency", "")
-    goal = answers.get("goal", "")
-    pref = answers.get("preference", "")
-    exp = answers.get("experience", "")
-
-    if freq == "1-2 раза в неделю":
-        scores["Старт"] += SCORES.get("start_q1_1-2", 0)
-        scores["Стандарт"] += SCORES.get("standard_q1_1-2", 0)
-    elif freq == "3-4 раза в неделю":
-        scores["Персональный"] += SCORES.get("personal_q1_3-4", 0)
-        scores["Стандарт"] += SCORES.get("standard_q1_3-4", 0)
-    elif freq == "Каждый день":
-        scores["Профи"] += SCORES.get("pro_q1_every", 0)
-        scores["Стандарт"] += SCORES.get("standard_q1_every", 0)
-
-    if goal == "Похудение":
-        scores["Старт"] += SCORES.get("start_q2_lose", 0)
-        scores["Стандарт"] += SCORES.get("standard_q2_lose", 0)
-    elif goal == "Набор массы":
-        scores["Персональный"] += SCORES.get("personal_q2_gain", 0)
-        scores["Профи"] += SCORES.get("pro_q2_gain_sec", 0)
-        scores["Стандарт"] += SCORES.get("standard_q2_gain_sec", 0)
-    elif goal == "Общий тонус и здоровье":
-        scores["Персональный"] += SCORES.get("personal_q2_tone_secondary", 0)
-        scores["Профи"] += SCORES.get("pro_q2_tone", 0)
-        scores["Старт"] += SCORES.get("start_q2_tone", 0)
-        scores["Стандарт"] += SCORES.get("standard_q2_tone", 0)
-
-    if pref == "Самостоятельно":
-        scores["Старт"] += SCORES.get("start_q3_alone", 0)
-    elif pref == "С тренером":
-        scores["Персональный"] += SCORES.get("personal_q3_trainer", 0)
-        scores["Профи"] += SCORES.get("pro_q3_trainer_sec", 0)
-        scores["Стандарт"] += SCORES.get("standard_q3_trainer_sec", 0)
-    elif pref == "В группе":
-        scores["Стандарт"] += SCORES.get("standard_q3_group", 0)
-        scores["Профи"] += SCORES.get("pro_q3_group_sec", 0)
-
-    if exp == "Новичок":
-        scores["Старт"] += SCORES.get("start_q4_beginner", 0)
-    elif exp == "Средний уровень":
-        scores["Стандарт"] += SCORES.get("standard_q4_medium", 0)
-    elif exp == "Продвинутый":
-        scores["Профи"] += SCORES.get("pro_q4_advanced", 0)
-
-    best_tariff = max(scores, key=scores.get)
-    return best_tariff, TARIFFS[best_tariff]
-
-
-async def show_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answers = context.user_data.get("answers", {})
+async def show_result(message: Message, state: FSMContext):
+    answers = (await state.get_data()).get("answers", {})
     tariff_name, tariff_info = calculate_tariff(answers)
     price = tariff_info["price"]
     desc = tariff_info["description"]
 
-    result_id = save_quiz_result(
-        user_id=update.effective_user.id,
-        username=update.effective_user.username,
+    result_id = await save_quiz_result(
+        user_id=message.chat.id,
+        username=message.chat.username,
         answers=answers,
         tariff=tariff_name,
         price=f"{price} ₽/мес",
         description=desc,
     )
-    context.user_data["result_id"] = result_id
-    context.user_data["tariff_name"] = tariff_name
-    context.user_data["tariff_price"] = price
+    await state.update_data(result_id=result_id, tariff_name=tariff_name, tariff_price=price)
 
     text = (
         f"Судя по ответам, вам подойдёт тариф <b>{tariff_name}</b>.\n"
         f"Он включает: {desc}.\n"
         f"Стоимость: от {price} ₽/мес"
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Узнать подробнее", callback_data="details")],
-        [InlineKeyboardButton("Оставить заявку на консультацию", callback_data="contact")],
-    ])
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
-    else:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=keyboard, parse_mode="HTML")
-
-    return RESULT
+    await message.answer(text=text, reply_markup=kb_result(), parse_mode=ParseMode.HTML)
+    await state.set_state(QuizStates.result)
 
 
-async def result_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "details":
-        tariff_name = context.user_data.get("tariff_name")
+async def handle_result_action(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "details":
+        tariff_name = (await state.get_data()).get("tariff_name")
         tariff_info = TARIFFS[tariff_name]
         text = (
             f"Тариф <b>{tariff_name}</b>\n"
@@ -175,110 +167,72 @@ async def result_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Описание: {tariff_info['description']}\n\n"
             f"Хотите оставить заявку на консультацию?"
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Оставить заявку", callback_data="contact")],
-            [InlineKeyboardButton("Назад", callback_data="back_to_result")],
-        ])
-        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
-    elif query.data == "contact":
-        await query.edit_message_text("Как вас зовут?")
-        return CONTACT_NAME
-    elif query.data == "back_to_result":
-        return await show_result(update, context)
-
-    return RESULT
-
-
-async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("Отлично. Теперь оставьте ваш номер телефона:")
-    return CONTACT_PHONE
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton("Оставить заявку", callback_data="contact")],
+                    [InlineKeyboardButton("Назад", callback_data="back_to_result")],
+                ]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    elif callback.data == "contact":
+        await callback.message.edit_text("Как вас зовут?")
+        await state.set_state(QuizStates.contact_name)
+    elif callback.data == "back_to_result":
+        await show_result(callback.message, state)
 
 
-async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text.strip()
-    name = context.user_data.get("name", "")
-    phone = context.user_data.get("phone", "")
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Все верно", callback_data="confirm")],
-        [InlineKeyboardButton("Исправить", callback_data="retry_contact")],
-    ])
-    await update.message.reply_text(
-        f"Проверьте данные:\nИмя: {name}\nТелефон: {phone}",
-        reply_markup=keyboard,
+@router.message(StateFilter(QuizStates.contact_name))
+async def get_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("Отлично. Теперь оставьте ваш номер телефона:")
+    await state.set_state(QuizStates.contact_phone)
+
+
+@router.message(StateFilter(QuizStates.contact_phone))
+async def get_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text.strip())
+    data = await state.get_data()
+    await message.answer(
+        f"Проверьте данные:\nИмя: {data.get('name', '')}\nТелефон: {data.get('phone', '')}",
+        reply_markup=kb_confirm(),
     )
-    return CONTACT_CONFIRM
+    await state.set_state(QuizStates.contact_confirm)
 
 
-async def confirm_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "confirm":
-        result_id = context.user_data.get("result_id")
-        name = context.user_data.get("name", "")
-        phone = context.user_data.get("phone", "")
-        save_contact(result_id, name, phone)
-        await query.edit_message_text("Спасибо! Мы свяжемся с вами в течение часа.")
-
-        context.application.bot_data.setdefault("_pending_leads", [])
-        context.application.bot_data["_pending_leads"].append(result_id)
-        await notify_admin(context, result_id)
-    elif query.data == "retry_contact":
-        await query.edit_message_text("Как вас зовут?")
-        return CONTACT_NAME
-
-    return ConversationHandler.END
+async def confirm_contact(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    result_id = data.get("result_id")
+    name = data.get("name", "")
+    phone = data.get("phone", "")
+    await save_contact(result_id, name, phone)
+    await callback.message.edit_text("Спасибо! Мы свяжемся с вами в течение часа.")
+    await notify_admin(bot, result_id)
+    await state.clear()
 
 
-async def notify_admin(context: ContextTypes.DEFAULT_TYPE, result_id: int):
-    data = get_quiz_result_with_contact(result_id)
-    tariff = data.get("tariff", "")
-    price = data.get("price", "")
-    answer_lines = []
-    answers = data.get("answers", {})
-    if isinstance(answers, str):
-        answers = json.loads(answers)
-    for q in QUESTIONS:
-        answer_lines.append(f"{q['text']} — {answers.get(q['key'], '-')}")
+async def retry_contact(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Как вас зовут?")
+    await state.set_state(QuizStates.contact_name)
 
+
+async def notify_admin(bot: Bot, result_id: int):
+    data = await get_quiz_result_with_contact(result_id)
+    if not data:
+        return
+    answers = json.loads(data["answers"]) if isinstance(data["answers"], str) else data["answers"]
+    answer_lines = [f"{q['text']} — {answers.get(q['key'], '-')}" for q in QUESTIONS]
     contact = data.get("contact") or {}
     text = (
         "Новый лид из бота-квиза:\n\n"
         f"Пользователь: @{data.get('username', 'без username')} (id: {data.get('user_id')})\n"
-        f"Тариф: {tariff} ({price})\n\n"
+        f"Тариф: {data.get('tariff')} ({data.get('price')})\n\n"
         f"Ответы:\n" + "\n".join(answer_lines) + "\n\n"
         f"Контакт: {contact.get('name', '-')}, {contact.get('phone', '-')}"
     )
     try:
-        await context.bot.send_message(chat_id=get_admin_chat_id(), text=text)
-    except Exception as e:
-        logger.error(f"Failed to notify admin: {e}")
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text("Диалог отменён. Чтобы начать заново, нажмите /start.")
-    return ConversationHandler.END
-
-
-def build_application() -> Application:
-    init_db()
-    application = Application.builder().token(get_bot_token()).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MENU: [CallbackQueryHandler(start_quiz, pattern="^start_quiz$")],
-            Q1: [CallbackQueryHandler(handle_answer)],
-            Q2: [CallbackQueryHandler(handle_answer)],
-            Q3: [CallbackQueryHandler(handle_answer)],
-            Q4: [CallbackQueryHandler(handle_answer)],
-            RESULT: [CallbackQueryHandler(result_buttons)],
-            CONTACT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            CONTACT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
-            CONTACT_CONFIRM: [CallbackQueryHandler(confirm_contact)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    application.add_handler(conv)
-    return application
+        await bot.send_message(chat_id=get_admin_chat_id(), text=text)
+    except Exception as exc:
+        logger.error("Failed to notify admin: %s", exc)

@@ -1,89 +1,108 @@
-import os
 import json
 import os
-import sqlite3
 from datetime import datetime
-from typing import Optional
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from src.config import DB_PATH
+from src.models import Base, Contact, QuizResult
+
+engine = create_async_engine(f"sqlite+aiosqlite:///{DB_PATH}", echo=False)
+async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-DB_PATH = "data/quiz.db"
+async def init_db():
+    data_dir = os.path.dirname(DB_PATH)
+    if data_dir:
+        os.makedirs(data_dir, exist_ok=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await seed_demo_data()
 
 
-def init_db():
-    os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS quiz_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            answers TEXT NOT NULL,
-            tariff TEXT NOT NULL,
-            price TEXT NOT NULL,
-            description TEXT NOT NULL,
-            created_at TEXT NOT NULL
+async def seed_demo_data():
+    async with async_session() as session:
+        existing = (await session.scalars(select(QuizResult))).first()
+        if existing:
+            return
+        demo = QuizResult(
+            user_id=999,
+            username="demo",
+            answers=json.dumps(
+                {
+                    "frequency": "1-2 раза в неделю",
+                    "goal": "Похудение",
+                    "preference": "Самостоятельно",
+                    "experience": "Новичок",
+                },
+                ensure_ascii=False,
+            ),
+            tariff="Старт",
+            price="1 900 ₽/мес",
+            description="Базовый абонемент + вводная консультация",
+            created_at=datetime.utcnow().isoformat(),
         )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            quiz_result_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (quiz_result_id) REFERENCES quiz_results (id)
+        session.add(demo)
+        await session.commit()
+
+
+async def save_quiz_result(
+    user_id: int, username: str | None, answers: dict, tariff: str, price: str, description: str
+) -> int:
+    async with async_session() as session:
+        result = QuizResult(
+            user_id=user_id,
+            username=username,
+            answers=json.dumps(answers, ensure_ascii=False),
+            tariff=tariff,
+            price=price,
+            description=description,
+            created_at=datetime.utcnow().isoformat(),
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        session.add(result)
+        await session.commit()
+        await session.refresh(result)
+        return result.id
 
 
-def save_quiz_result(user_id: int, username: Optional[str], answers: dict, tariff: str, price: str, description: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO quiz_results (user_id, username, answers, tariff, price, description, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            user_id,
-            username,
-            json.dumps(answers, ensure_ascii=False),
-            tariff,
-            price,
-            description,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-    result_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return result_id
+async def save_contact(quiz_result_id: int, name: str, phone: str):
+    async with async_session() as session:
+        contact = Contact(
+            quiz_result_id=quiz_result_id,
+            name=name,
+            phone=phone,
+            created_at=datetime.utcnow().isoformat(),
+        )
+        session.add(contact)
+        await session.commit()
+        await session.refresh(contact)
 
 
-def save_contact(quiz_result_id: int, name: str, phone: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO contacts (quiz_result_id, name, phone, created_at) VALUES (?, ?, ?, ?)",
-        (quiz_result_id, name, phone, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_quiz_result_with_contact(result_id: int) -> dict:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM quiz_results WHERE id = ?", (result_id,))
-    result = c.fetchone()
-    result_dict = dict(result)
-    c.execute("SELECT * FROM contacts WHERE quiz_result_id = ?", (result_id,))
-    contact = c.fetchone()
-    result_dict["contact"] = dict(contact) if contact else None
-    conn.close()
-    return result_dict
+async def get_quiz_result_with_contact(result_id: int) -> dict:
+    async with async_session() as session:
+        result = await session.get(QuizResult, result_id)
+        if not result:
+            return {}
+        contact = (
+            await session.scalars(select(Contact).where(Contact.quiz_result_id == result_id))
+        ).first()
+        return {
+            "id": result.id,
+            "user_id": result.user_id,
+            "username": result.username,
+            "answers": result.answers,
+            "tariff": result.tariff,
+            "price": result.price,
+            "description": result.description,
+            "created_at": result.created_at,
+            "contact": {
+                "id": contact.id,
+                "quiz_result_id": contact.quiz_result_id,
+                "name": contact.name,
+                "phone": contact.phone,
+                "created_at": contact.created_at,
+            }
+            if contact
+            else None,
+        }
